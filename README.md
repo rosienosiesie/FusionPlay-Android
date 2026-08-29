@@ -6,15 +6,6 @@ FusionPlay 是一个面向 Android 5.0 及以上设备的局域网投送接收�
 
 源码仓库：<https://github.com/18223392722/FusionPlay>
 
-## 功能
-
-- AirPlay 音频接收、媒体信息与播放状态同步。
-- DLNA/UPnP AVTransport 接收与本地播放。
-- 进程内实现的小米妙播发现、控制、鉴权兼容和音频接收。
-- `armeabi-v7a`、`arm64-v8a`、`x86_64` 单一通用 APK。
-- Android 5.0（API 21）最低版本兼容。
-- 遥控器、无障碍保活、自动唤起、媒体通知与日志导出。
-
 ## 目录结构
 
 ```text
