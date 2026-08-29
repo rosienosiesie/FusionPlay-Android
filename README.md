@@ -2,10 +2,6 @@
 
 FusionPlay 是一个面向 Android 5.0 及以上设备的局域网投送接收端，统一接收 AirPlay、DLNA 与小米妙播音频，并提供横屏播放器、媒体通知、遥控器焦点导航和诊断日志导出。
 
-当前开源版本为 **1.2.3**，应用 ID 为 `com.fusionplay.android`。
-
-源码仓库：<https://github.com/18223392722/FusionPlay>
-
 ## 目录结构
 
 ```text
