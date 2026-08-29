@@ -1,0 +1,37 @@
+name: fusionplay_android_flutter
+description: FusionPlay Android receiver frontend.
+homepage: https://github.com/18223392722/FusionPlay
+repository: https://github.com/18223392722/FusionPlay
+issue_tracker: https://github.com/18223392722/FusionPlay/issues
+publish_to: none
+version: 1.2.3+10203
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_svg: 2.2.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: 6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/airplay-broadcast.svg
+    - assets/auto-wake.svg
+    - assets/device-speaker.svg
+    - assets/device-tablet.svg
+    - assets/device-television.svg
+    - assets/device-vehicle.svg
+    - assets/icon-pause.svg
+    - assets/icon-play-arrow.svg
+    - assets/icon-power-settings-new.svg
+    - assets/icon-skip-next.svg
+    - assets/icon-skip-previous.svg
+    - assets/miplay-logo.svg
+    - assets/music-note-placeholder.svg

@@ -1,0 +1,64 @@
+[package]
+name = "airplay-receiver-core"
+version = "1.0.4"
+edition = "2024"
+autobins = false
+license = "AGPL-3.0-only"
+description = "Rust AirPlay 2, DLNA, PTP timing, and audio core for FusionPlay"
+
+[lib]
+name = "fusionplay_core"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+aes = "0.9"
+anyhow = "1"
+base64 = "0.22"
+cbc = { version = "0.2", features = ["alloc"] }
+fusionplay-miplay-sdk = { path = "../FusionPlay.MiPlaySdk" }
+hex = "0.4"
+hmac = "0.12"
+httparse = "1.10"
+if-addrs = { path = "../FusionPlay.AndroidIfAddrs" }
+md-5 = "0.10"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shairplay = { path = "../../vendor/shairplay", version = "=0.7.0", features = ["hls"] }
+socket2 = "0.6"
+symphonia = { version = "0.6", default-features = false, features = ["aac"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+oboe = "0.6.1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+] }
+
+[[bin]]
+name = "airplay-receiver-core"
+path = "src/main.rs"
+
+[patch.crates-io]
+if-addrs = { path = "../FusionPlay.AndroidIfAddrs" }
+
+[profile.release]
+# Keep the receiver fast while allowing LLVM to deduplicate code across the
+# AirPlay, DLNA and MiPlay crates in the final Android shared library.
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

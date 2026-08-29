@@ -1,0 +1,17 @@
+[package]
+name = "if-addrs"
+version = "0.15.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "Android 5 compatible if-addrs API adapter for FusionPlay"
+
+[features]
+default = []
+link-local = []
+
+[lib]
+name = "if_addrs"
+path = "src/lib.rs"
+
+[dependencies]
+getifs = "0.6.1"

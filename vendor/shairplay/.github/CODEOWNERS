@@ -1,0 +1,4 @@
+# CODEOWNERS for shairplay-rust repo
+# Assign ownership to @metaneutrons for all files
+
+* @metaneutrons

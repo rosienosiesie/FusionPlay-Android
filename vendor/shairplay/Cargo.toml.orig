@@ -1,0 +1,82 @@
+[package]
+name = "shairplay"
+version = "0.7.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Pure Rust AirPlay server library"
+keywords = ["airplay", "raop", "audio", "streaming", "apple"]
+categories = ["multimedia::audio", "network-programming"]
+readme = "README.md"
+homepage = "https://github.com/metaneutrons/shairplay-rust"
+repository = "https://github.com/fabianlindfors/shairplay"
+rust-version = "1.88"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "signal", "io-util", "time"] }
+bytes = "1"
+
+# HTTP/RTSP parsing
+httparse = "1"
+
+# Crypto
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rsa = "0.9"
+aes = "0.9"
+cbc = "0.2"
+ctr = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+rand = "0.8"
+subtle = "2" # constant-time comparison of authenticators/proofs
+
+# Encoding / parsing
+base64 = "0.22"
+plist = "1.9"
+
+# AirPlay 2 (optional)
+chacha20poly1305 = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+num-bigint = { version = "0.4", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+rubato = { version = "3", optional = true }
+symphonia = { version = "0.6", optional = true, features = ["aac"] }
+
+# Error handling
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+hex = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+astro-dnssd = "0.3"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mdns-sd = "0.20"
+gethostname = "1"
+
+[features]
+default = []
+resample = ["dep:rubato"]
+ap2 = ["resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:symphonia"]
+video = ["ap2"]
+hls = ["ap2"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serial_test = "3"
+cpal = "0.17"
+rubato = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+openh264 = "0.9"
+minifb = "0.28"
+
+[[example]]
+name = "player"
+required-features = []

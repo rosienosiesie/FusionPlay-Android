@@ -1,0 +1,40 @@
+# Build outputs and caches
+**/build/
+**/.gradle/
+**/.kotlin/
+**/.dart_tool/
+**/target/
+**/.cxx/
+/.tooling/
+/artifacts/
+
+# Local IDE and generated metadata
+**/*.iml
+.idea/
+.vscode/
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+
+# Local Android, Flutter and signing configuration
+**/local.properties
+**/key.properties
+**/*.keystore
+**/*.jks
+.env
+.env.*
+
+# Packaged outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+app.*.symbols
+app.*.map.json
+
+# Runtime identity and diagnostics
+/src/AirPlayReceiver.Core/airplay-state.json
+hs_err_pid*.log
+replay_pid*.log

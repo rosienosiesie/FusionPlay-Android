@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FusionPlay</string>
+    <string name="receiver_notification_channel">FusionPlay 接收服务</string>
+    <string name="receiver_notification_title">FusionPlay</string>
+    <string name="receiver_notification_text">运行中</string>
+    <string name="accessibility_keep_alive_name">FusionPlay</string>
+    <string name="accessibility_keep_alive_description">用于开机自启/后台保活/自动唤起</string>
+    <string name="accessibility_permission_prompt">请授权无障碍权限</string>
+</resources>
