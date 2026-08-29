@@ -11,6 +11,7 @@ import 'ui/artwork.dart';
 import 'ui/player_view.dart';
 import 'ui/remote_focus.dart';
 import 'ui/settings_view.dart';
+import 'ui/vector_icon.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -411,7 +412,9 @@ class _FusionPlayHomeState extends State<FusionPlayHome> {
                                 shape: const CircleBorder(),
                                 child: IconButton(
                                   onPressed: widget.controller.clearError,
-                                  icon: const Icon(Icons.close_rounded),
+                                  icon: const FusionVectorIcon(
+                                    FusionIcons.close,
+                                  ),
                                 ),
                               ),
                             ],
@@ -485,8 +488,8 @@ class _SettingsButton extends StatelessWidget {
           padding: EdgeInsets.zero,
           tooltip: '设置',
           onPressed: onPressed,
-          icon: Icon(
-            Icons.settings_rounded,
+          icon: FusionVectorIcon(
+            FusionIcons.settings,
             size: 18,
             color: (light ? Colors.white : Colors.black).withValues(alpha: .88),
           ),

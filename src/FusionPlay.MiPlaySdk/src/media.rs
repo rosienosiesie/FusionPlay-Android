@@ -221,6 +221,188 @@ struct MiPlayPresentationClock {
     presentation_offset_valid: AtomicBool,
 }
 
+/// Live receiver measurements mirrored back to Xiaomi's RTSP source.
+///
+/// The official sink reports the current playout queue, measured output
+/// latency, received RTP packet number, and rolling bitrate roughly four times
+/// per second. RTP arrival samples are also retained in the sender's 90 kHz
+/// clock domain so network jitter can be diagnosed independently from the
+/// playout queue.
+struct MiPlayLatencyTelemetry {
+    rtp: Mutex<RtpTelemetryState>,
+    buffered_frames: AtomicU64,
+    output_latency_micros: AtomicU64,
+}
+
+struct RtpTelemetryState {
+    first_arrival: Option<Instant>,
+    last_sequence: Option<u64>,
+    last_timestamp: Option<u64>,
+    regression_samples: VecDeque<(f64, f64)>,
+    bitrate_samples: VecDeque<(Instant, usize)>,
+    bitrate_bytes: usize,
+    bitrate_bps: u64,
+    arrival_residual_millis: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MiPlayLatencySnapshot {
+    latency_millis: u32,
+    bitrate_bps: u64,
+    rtp_packet_number: u64,
+    arrival_residual_millis: f64,
+}
+
+impl MiPlayLatencyTelemetry {
+    fn new() -> Self {
+        Self {
+            rtp: Mutex::new(RtpTelemetryState {
+                first_arrival: None,
+                last_sequence: None,
+                last_timestamp: None,
+                regression_samples: VecDeque::with_capacity(MIPLAY_RTP_REGRESSION_SAMPLES),
+                bitrate_samples: VecDeque::new(),
+                bitrate_bytes: 0,
+                bitrate_bps: 0,
+                arrival_residual_millis: 0.0,
+            }),
+            buffered_frames: AtomicU64::new(0),
+            output_latency_micros: AtomicU64::new(0),
+        }
+    }
+
+    fn observe_rtp(
+        &self,
+        sequence_number: u16,
+        timestamp: u32,
+        packet_bytes: usize,
+        arrival: Instant,
+    ) {
+        let Ok(mut state) = self.rtp.lock() else {
+            return;
+        };
+        let sequence = extend_wrapping_counter(state.last_sequence, u64::from(sequence_number), 16);
+        let timestamp = extend_wrapping_counter(state.last_timestamp, u64::from(timestamp), 32);
+        state.last_sequence = Some(
+            state
+                .last_sequence
+                .map_or(sequence, |last| last.max(sequence)),
+        );
+        state.last_timestamp = Some(timestamp);
+
+        let first_arrival = *state.first_arrival.get_or_insert(arrival);
+        let arrival_ticks = arrival
+            .saturating_duration_since(first_arrival)
+            .as_secs_f64()
+            * f64::from(MIPLAY_RTP_CLOCK_HZ);
+        state
+            .regression_samples
+            .push_back((timestamp as f64, arrival_ticks));
+        while state.regression_samples.len() > MIPLAY_RTP_REGRESSION_SAMPLES {
+            state.regression_samples.pop_front();
+        }
+        state.arrival_residual_millis =
+            rtp_arrival_residual_millis(&state.regression_samples).unwrap_or(0.0);
+
+        state.bitrate_samples.push_back((arrival, packet_bytes));
+        state.bitrate_bytes = state.bitrate_bytes.saturating_add(packet_bytes);
+        while state
+            .bitrate_samples
+            .front()
+            .is_some_and(|(sampled_at, _)| {
+                arrival.saturating_duration_since(*sampled_at) > MIPLAY_BITRATE_WINDOW
+            })
+        {
+            if let Some((_, bytes)) = state.bitrate_samples.pop_front() {
+                state.bitrate_bytes = state.bitrate_bytes.saturating_sub(bytes);
+            }
+        }
+        if let Some((oldest, _)) = state.bitrate_samples.front() {
+            let elapsed = arrival.saturating_duration_since(*oldest).as_secs_f64();
+            if elapsed >= MIPLAY_MINIMUM_BITRATE_WINDOW.as_secs_f64() {
+                state.bitrate_bps = (state.bitrate_bytes as f64 * 8.0 / elapsed)
+                    .round()
+                    .max(0.0) as u64;
+            }
+        }
+    }
+
+    fn update_buffered_frames(&self, buffered_frames: usize) {
+        self.buffered_frames.store(
+            u64::try_from(buffered_frames).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    fn update_output_latency(&self, output_latency_millis: f64) {
+        let output_latency_micros = if output_latency_millis.is_finite() {
+            (output_latency_millis.max(0.0) * 1_000.0).round() as u64
+        } else {
+            0
+        };
+        self.output_latency_micros
+            .store(output_latency_micros, Ordering::Release);
+    }
+
+    fn snapshot(&self) -> Option<MiPlayLatencySnapshot> {
+        let state = self.rtp.lock().ok()?;
+        let rtp_packet_number = state.last_sequence?;
+        let queue_micros = self
+            .buffered_frames
+            .load(Ordering::Acquire)
+            .saturating_mul(1_000_000)
+            / u64::from(MIPLAY_SAMPLE_RATE_HZ);
+        let latency_micros =
+            queue_micros.saturating_add(self.output_latency_micros.load(Ordering::Acquire));
+        Some(MiPlayLatencySnapshot {
+            latency_millis: u32::try_from(latency_micros.saturating_add(500) / 1_000)
+                .unwrap_or(u32::MAX),
+            bitrate_bps: state.bitrate_bps,
+            rtp_packet_number,
+            arrival_residual_millis: state.arrival_residual_millis,
+        })
+    }
+}
+
+fn extend_wrapping_counter(previous: Option<u64>, raw: u64, bits: u32) -> u64 {
+    let Some(previous) = previous else {
+        return raw;
+    };
+    let modulus = 1_u64 << bits;
+    let mask = modulus - 1;
+    let half = modulus / 2;
+    let base = previous & !mask;
+    let mut candidate = base | (raw & mask);
+    if candidate.saturating_add(half) < previous {
+        candidate = candidate.saturating_add(modulus);
+    } else if candidate > previous.saturating_add(half) && candidate >= modulus {
+        candidate -= modulus;
+    }
+    candidate
+}
+
+fn rtp_arrival_residual_millis(samples: &VecDeque<(f64, f64)>) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let count = samples.len() as f64;
+    let mean_timestamp = samples.iter().map(|sample| sample.0).sum::<f64>() / count;
+    let mean_arrival = samples.iter().map(|sample| sample.1).sum::<f64>() / count;
+    let (covariance, variance) = samples.iter().fold((0.0, 0.0), |acc, sample| {
+        let timestamp = sample.0 - mean_timestamp;
+        let arrival = sample.1 - mean_arrival;
+        (acc.0 + timestamp * arrival, acc.1 + timestamp * timestamp)
+    });
+    if !variance.is_finite() || variance <= f64::EPSILON {
+        return None;
+    }
+    let slope = covariance / variance;
+    let intercept = mean_arrival - slope * mean_timestamp;
+    let latest = samples.back()?;
+    let residual_ticks = latest.1 - (slope * latest.0 + intercept);
+    Some(residual_ticks / (f64::from(MIPLAY_RTP_CLOCK_HZ) / 1_000.0))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct TimerSample {
     local_midpoint_micros: i64,
@@ -329,7 +511,8 @@ fn fit_clock_line(history: &VecDeque<ClockFitPoint>) -> (i64, f64, f64) {
         .front()
         .map(|first| latest.local_micros.saturating_sub(first.local_micros))
         .unwrap_or(0);
-    if history.len() < 3 || span_micros < MIPLAY_CLOCK_MIN_FIT_SPAN_MICROS {
+    if history.len() < MIPLAY_CLOCK_MIN_FIT_ROUNDS || span_micros < MIPLAY_CLOCK_MIN_FIT_SPAN_MICROS
+    {
         return (latest.local_micros, latest.offset_micros as f64, 1.0);
     }
 
@@ -608,7 +791,9 @@ fn spawn_timer_synchronizer(
                         offset_micros: offset,
                         round_trip_micros: network_rtt,
                     });
-                    thread::sleep(StdDuration::from_millis(20));
+                    thread::sleep(StdDuration::from_millis(
+                        MIPLAY_CLOCK_SAMPLE_INTERVAL_MILLIS,
+                    ));
                 }
 
                 if round_interrupted {
@@ -745,7 +930,7 @@ fn run_rtsp_receiver(
         .with_context(|| format!("connect RTSP source {host}:{port}"))?;
     control.set_nodelay(true).ok();
     control
-        .set_read_timeout(Some(StdDuration::from_millis(500)))
+        .set_read_timeout(Some(MIPLAY_RTSP_POLL_INTERVAL))
         .ok();
     control
         .set_write_timeout(Some(StdDuration::from_secs(3)))
@@ -764,6 +949,10 @@ fn run_rtsp_receiver(
     let mut session_id = String::new();
     let local_challenge = random_hex_32();
     let presentation_clock = Arc::new(MiPlayPresentationClock::new());
+    let latency_telemetry = Arc::new(MiPlayLatencyTelemetry::new());
+    let mut latency_cseq = 1_000_u32;
+    let mut next_latency_report = Instant::now() + MIPLAY_LATENCY_REPORT_INTERVAL;
+    let mut latency_reporting_started = false;
     let timer_sync_running = Arc::new(AtomicBool::new(true));
     let _timer_sync_guard = SessionRunFlag(Arc::clone(&timer_sync_running));
     let timer_force_sync = Arc::new(AtomicBool::new(false));
@@ -772,6 +961,27 @@ fn run_rtsp_receiver(
     loop {
         if current_media_generation.load(Ordering::Acquire) != media_generation {
             return Ok(());
+        }
+        let now = Instant::now();
+        if !session_id.is_empty() && now >= next_latency_report {
+            if let Some(snapshot) = latency_telemetry.snapshot() {
+                send_video_latency_request(&mut control, latency_cseq, snapshot)?;
+                latency_cseq = latency_cseq.wrapping_add(1);
+                if !latency_reporting_started {
+                    latency_reporting_started = true;
+                    events(json!({
+                        "event": "latency_feedback_started",
+                        "protocol": "xiaomi_miplay",
+                        "interval_ms": MIPLAY_LATENCY_REPORT_INTERVAL.as_millis(),
+                        "rtp_clock_hz": MIPLAY_RTP_CLOCK_HZ,
+                        "latency_ms": snapshot.latency_millis,
+                        "bitrate_bps": snapshot.bitrate_bps,
+                        "rtp_packet_number": snapshot.rtp_packet_number,
+                        "arrival_residual_ms": snapshot.arrival_residual_millis,
+                    }));
+                }
+            }
+            next_latency_report = now + MIPLAY_LATENCY_REPORT_INTERVAL;
         }
         let Some(message) = read_rtsp_message(&mut control, &mut input)? else {
             continue;
@@ -898,6 +1108,7 @@ fn run_rtsp_receiver(
                             playback_gate.paused_flag(),
                             Arc::clone(&volume_percent),
                             Arc::clone(&presentation_clock),
+                            Arc::clone(&latency_telemetry),
                             media_generation,
                             Arc::clone(&current_media_generation),
                             Arc::clone(&events),
@@ -1034,6 +1245,7 @@ fn spawn_media_reader(
     paused: Arc<AtomicBool>,
     volume_percent: Arc<AtomicU32>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     media_generation: u64,
     current_media_generation: Arc<AtomicU64>,
     events: EventEmitter,
@@ -1049,6 +1261,7 @@ fn spawn_media_reader(
                 paused,
                 volume_percent,
                 presentation_clock,
+                latency_telemetry,
                 media_generation,
                 Arc::clone(&current_media_generation),
                 Arc::clone(&events),
@@ -1077,6 +1290,7 @@ fn run_media_reader(
     paused: Arc<AtomicBool>,
     volume_percent: Arc<AtomicU32>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     media_generation: u64,
     current_media_generation: Arc<AtomicU64>,
     events: EventEmitter,
@@ -1089,6 +1303,7 @@ fn run_media_reader(
         paused,
         volume_percent,
         presentation_clock,
+        Arc::clone(&latency_telemetry),
         Arc::clone(&events),
     )?;
     let encrypted_media_expected = keys.is_some();
@@ -1124,7 +1339,14 @@ fn run_media_reader(
         )? {
             return Ok(());
         }
+        let arrival = Instant::now();
         let rtp_packet = parse_rtp_packet(&rtp).context("parse MiPlay RTP packet")?;
+        latency_telemetry.observe_rtp(
+            rtp_packet.sequence_number,
+            rtp_packet.timestamp,
+            rtp.len(),
+            arrival,
+        );
         for packet in rtp_packet.payload.chunks_exact(188) {
             for audio_pes in demuxer.push_ts_at(packet, Some(rtp_packet.timestamp_micros))? {
                 let aac = &audio_pes.payload;
@@ -1175,6 +1397,8 @@ fn read_exact_for_generation(
 
 struct RtpPacketView<'a> {
     payload: &'a [u8],
+    sequence_number: u16,
+    timestamp: u32,
     timestamp_micros: i64,
 }
 
@@ -1182,6 +1406,7 @@ fn parse_rtp_packet(packet: &[u8]) -> Option<RtpPacketView<'_>> {
     if packet.len() < 12 || packet[0] >> 6 != 2 {
         return None;
     }
+    let sequence_number = u16::from_be_bytes(packet[2..4].try_into().ok()?);
     let rtp_timestamp = u32::from_be_bytes(packet[4..8].try_into().ok()?);
     let mut offset = 12 + usize::from(packet[0] & 0x0f) * 4;
     if packet[0] & 0x10 != 0 {
@@ -1197,10 +1422,12 @@ fn parse_rtp_packet(packet: &[u8]) -> Option<RtpPacketView<'_>> {
     }
     (offset <= end).then_some(RtpPacketView {
         payload: &packet[offset..end],
-        // Xiaomi's audio-display RTP timestamp follows the 48 kHz audio
-        // sampling clock, not MPEG-TS' separate 90 kHz PES clock. Keeping
-        // these clocks distinct is required for sender-clock scheduling.
-        timestamp_micros: i64::from(rtp_timestamp) * 1_000_000 / i64::from(MIPLAY_SAMPLE_RATE_HZ),
+        sequence_number,
+        timestamp: rtp_timestamp,
+        // Payload type 33 is RTP/MP2T and follows the mandatory 90 kHz clock.
+        // The contained AAC remains 48 kHz, while both RTP and PES timestamps
+        // advance by 1,920 ticks for each 1,024-sample AAC frame.
+        timestamp_micros: i64::from(rtp_timestamp) * 1_000_000 / i64::from(MIPLAY_RTP_CLOCK_HZ),
     })
 }
 
@@ -1705,6 +1932,7 @@ fn should_hard_drop_late_frames(
 }
 
 const MIPLAY_SAMPLE_RATE_HZ: u32 = 48_000;
+const MIPLAY_RTP_CLOCK_HZ: u32 = 90_000;
 const MIPLAY_SOURCE_SAMPLE_RATE: usize = MIPLAY_SAMPLE_RATE_HZ as usize;
 const MIPLAY_SOURCE_CHANNELS: usize = 2;
 const MIPLAY_GROUP_PLAY_DELAY_MILLIS: usize = 800;
@@ -1725,9 +1953,11 @@ const MIPLAY_RUNNING_LATE_DROP_MICROS: f64 = 25_000.0;
 const MIPLAY_TIMER_PACKET_BYTES: usize = 40;
 const MIPLAY_CLOCK_SYNC_SAMPLES: usize = 10;
 const MIPLAY_CLOCK_FILTER_SAMPLES: usize = 10;
-const MIPLAY_CLOCK_FIT_HISTORY: usize = 12;
+const MIPLAY_CLOCK_FIT_HISTORY: usize = 32;
+const MIPLAY_CLOCK_MIN_FIT_ROUNDS: usize = 20;
 const MIPLAY_CLOCK_RESYNC_POLLS: usize = 50;
 const MIPLAY_CLOCK_FORCE_POLL_MILLIS: u64 = 100;
+const MIPLAY_CLOCK_SAMPLE_INTERVAL_MILLIS: u64 = 10;
 const MIPLAY_CLOCK_MAX_RTT_MICROS: i64 = 250_000;
 const MIPLAY_CLOCK_MIN_FIT_SPAN_MICROS: i64 = 5_000_000;
 const MIPLAY_CLOCK_MAX_FREQUENCY_ERROR: f64 = 0.0005;
@@ -1735,6 +1965,13 @@ const MIPLAY_CLOCK_PHASE_SMOOTHING: f64 = 0.25;
 const MIPLAY_CLOCK_RATE_SMOOTHING: f64 = 0.25;
 const MIPLAY_CLOCK_MAX_PHASE_STEP_MICROS: i64 = 5_000;
 const MIPLAY_AAC_FRAME_MICROS: f64 = 1024.0 * 1_000_000.0 / MIPLAY_SAMPLE_RATE_HZ as f64;
+const MIPLAY_LATENCY_REPORT_INTERVAL: StdDuration = StdDuration::from_millis(250);
+const MIPLAY_RTSP_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
+const MIPLAY_BITRATE_WINDOW: StdDuration = StdDuration::from_secs(2);
+const MIPLAY_MINIMUM_BITRATE_WINDOW: StdDuration = StdDuration::from_millis(250);
+const MIPLAY_RTP_REGRESSION_SAMPLES: usize = 128;
+const MIPLAY_OUTPUT_LATENCY_REFRESH_CALLBACKS: u32 = 64;
+const MIPLAY_OUTPUT_LATENCY_SMOOTHING: f64 = 0.2;
 
 struct AacPlayer {
     decoder: AacDecoder,
@@ -1747,6 +1984,7 @@ struct AacPlayer {
     decoded_frames: u64,
     non_silent_diagnostic_emitted: bool,
     pes_layout_diagnostic_emitted: bool,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 }
 
@@ -1783,6 +2021,7 @@ impl AacPlayer {
         paused: Arc<AtomicBool>,
         volume_percent: Arc<AtomicU32>,
         presentation_clock: Arc<MiPlayPresentationClock>,
+        latency_telemetry: Arc<MiPlayLatencyTelemetry>,
         events: EventEmitter,
     ) -> Result<Self> {
         let mut parameters = AudioCodecParameters::new();
@@ -1798,6 +2037,7 @@ impl AacPlayer {
             paused,
             volume_percent,
             presentation_clock,
+            Arc::clone(&latency_telemetry),
             Arc::clone(&events),
         )?;
 
@@ -1812,6 +2052,7 @@ impl AacPlayer {
             decoded_frames: 0,
             non_silent_diagnostic_emitted: false,
             pes_layout_diagnostic_emitted: false,
+            latency_telemetry,
             events,
         })
     }
@@ -1905,6 +2146,8 @@ impl AacPlayer {
         }
         if let Ok(mut queue) = self.queue.lock() {
             queue.push_timed(&self.decoded_samples, media_pts_micros);
+            self.latency_telemetry
+                .update_buffered_frames(queue.buffered_frames());
         }
         Ok(())
     }
@@ -2002,6 +2245,7 @@ fn open_native_audio_output(
     paused: Arc<AtomicBool>,
     volume_percent: Arc<AtomicU32>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 ) -> Result<(Arc<Mutex<PcmQueue>>, NativeAudioStream)> {
     let host = cpal::default_host();
@@ -2097,6 +2341,7 @@ fn open_native_audio_output(
             paused,
             volume_percent,
             Arc::clone(&presentation_clock),
+            Arc::clone(&latency_telemetry),
             Arc::clone(&events),
         ),
         cpal::SampleFormat::I16 => build_output::<i16>(
@@ -2106,6 +2351,7 @@ fn open_native_audio_output(
             paused,
             volume_percent,
             Arc::clone(&presentation_clock),
+            Arc::clone(&latency_telemetry),
             Arc::clone(&events),
         ),
         cpal::SampleFormat::U16 => build_output::<u16>(
@@ -2115,6 +2361,7 @@ fn open_native_audio_output(
             paused,
             volume_percent,
             Arc::clone(&presentation_clock),
+            Arc::clone(&latency_telemetry),
             Arc::clone(&events),
         ),
         format => bail!("unsupported native sample format {format}"),
@@ -2129,6 +2376,7 @@ struct AndroidMiPlayAudioCallback {
     queue: Arc<Mutex<PcmQueue>>,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
@@ -2137,6 +2385,7 @@ struct AndroidMiPlayAudioCallback {
     synchronization_started: bool,
     endpoint_latency_millis: f64,
     endpoint_latency_initialized: bool,
+    latency_refresh_countdown: u32,
     timed_playback_started: bool,
 }
 
@@ -2152,15 +2401,26 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         let callback_frames = output.len();
         let output_sample_rate = self.output_sample_rate.load(Ordering::Acquire).max(1);
         let route_playback_rate = f64::from(MIPLAY_SAMPLE_RATE_HZ) / f64::from(output_sample_rate);
-        if !self.endpoint_latency_initialized {
+        if !self.endpoint_latency_initialized || self.latency_refresh_countdown == 0 {
             let observed_latency = stream.calculate_latency_millis().ok();
-            self.endpoint_latency_millis = normalized_output_latency_millis(
+            let measured_latency = normalized_output_latency_millis(
                 observed_latency,
                 output_sample_rate,
                 callback_frames,
             );
+            self.endpoint_latency_millis = if self.endpoint_latency_initialized {
+                self.endpoint_latency_millis * (1.0 - MIPLAY_OUTPUT_LATENCY_SMOOTHING)
+                    + measured_latency * MIPLAY_OUTPUT_LATENCY_SMOOTHING
+            } else {
+                measured_latency
+            };
             self.endpoint_latency_initialized = true;
+            self.latency_refresh_countdown = MIPLAY_OUTPUT_LATENCY_REFRESH_CALLBACKS;
+        } else {
+            self.latency_refresh_countdown -= 1;
         }
+        self.latency_telemetry
+            .update_output_latency(self.endpoint_latency_millis);
         if !self.callback_started {
             self.callback_started = true;
             (self.events)(json!({
@@ -2175,6 +2435,7 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             if let Ok(mut queue) = self.queue.lock() {
                 queue.clear();
             }
+            self.latency_telemetry.update_buffered_frames(0);
             output.fill((0.0, 0.0));
             return DataCallbackResult::Continue;
         }
@@ -2186,6 +2447,8 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
             output.fill((0.0, 0.0));
             return DataCallbackResult::Continue;
         };
+        self.latency_telemetry
+            .update_buffered_frames(queue.buffered_frames());
         let synchronized_frames = synchronized_buffer_frames(self.endpoint_latency_millis);
         let mut leading_silence_frames = 0_usize;
         let mut synchronization_mode = "buffer_window";
@@ -2256,6 +2519,8 @@ impl AudioOutputCallback for AndroidMiPlayAudioCallback {
         output[..leading_silence_frames].fill((0.0, 0.0));
         let callback_peak =
             queue.render_stereo_block(&mut output[leading_silence_frames..], playback_rate);
+        self.latency_telemetry
+            .update_buffered_frames(queue.buffered_frames());
         drop(queue);
         if callback_peak > 0.000_01 && !self.signal_started {
             self.signal_started = true;
@@ -2281,6 +2546,7 @@ fn open_native_audio_output(
     paused: Arc<AtomicBool>,
     _volume_percent: Arc<AtomicU32>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 ) -> Result<(Arc<Mutex<PcmQueue>>, NativeAudioStream)> {
     let queue = Arc::new(Mutex::new(PcmQueue::new()));
@@ -2290,6 +2556,7 @@ fn open_native_audio_output(
         Arc::clone(&queue),
         Arc::clone(&paused),
         Arc::clone(&presentation_clock),
+        Arc::clone(&latency_telemetry),
         Arc::clone(&events),
         commands.clone(),
         Arc::clone(&output_sample_rate),
@@ -2297,6 +2564,7 @@ fn open_native_audio_output(
     let route_queue = Arc::clone(&queue);
     let route_paused = Arc::clone(&paused);
     let route_clock = Arc::clone(&presentation_clock);
+    let route_telemetry = Arc::clone(&latency_telemetry);
     let route_events = Arc::clone(&events);
     let route_commands = commands.clone();
     let route_sample_rate = Arc::clone(&output_sample_rate);
@@ -2310,6 +2578,7 @@ fn open_native_audio_output(
                 route_queue,
                 route_paused,
                 route_clock,
+                route_telemetry,
                 route_events,
                 route_sample_rate,
             );
@@ -2334,6 +2603,7 @@ fn open_android_miplay_stream(
     queue: Arc<Mutex<PcmQueue>>,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
     commands: mpsc::Sender<AndroidMiPlayAudioCommand>,
     output_sample_rate: Arc<AtomicU32>,
@@ -2342,6 +2612,7 @@ fn open_android_miplay_stream(
         queue,
         paused,
         presentation_clock,
+        latency_telemetry,
         events,
         commands,
         output_sample_rate: Arc::clone(&output_sample_rate),
@@ -2350,6 +2621,7 @@ fn open_android_miplay_stream(
         synchronization_started: false,
         endpoint_latency_millis: 0.0,
         endpoint_latency_initialized: false,
+        latency_refresh_countdown: 0,
         timed_playback_started: false,
     };
     let mut stream = AudioStreamBuilder::default()
@@ -2382,6 +2654,7 @@ fn manage_android_miplay_output(
     queue: Arc<Mutex<PcmQueue>>,
     paused: Arc<AtomicBool>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
     output_sample_rate: Arc<AtomicU32>,
 ) {
@@ -2405,6 +2678,7 @@ fn manage_android_miplay_output(
                         Arc::clone(&queue),
                         Arc::clone(&paused),
                         Arc::clone(&presentation_clock),
+                        Arc::clone(&latency_telemetry),
                         Arc::clone(&events),
                         commands.clone(),
                         Arc::clone(&output_sample_rate),
@@ -2445,6 +2719,7 @@ fn build_output<T>(
     paused: Arc<AtomicBool>,
     volume_percent: Arc<AtomicU32>,
     presentation_clock: Arc<MiPlayPresentationClock>,
+    latency_telemetry: Arc<MiPlayLatencyTelemetry>,
     events: EventEmitter,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -2462,16 +2737,28 @@ where
     let nominal_playback_rate =
         MIPLAY_SOURCE_SAMPLE_RATE as f64 / f64::from(output_sample_rate.max(1));
     let mut endpoint_latency_millis = 0.0_f64;
+    let mut endpoint_latency_initialized = false;
+    let mut latency_refresh_countdown = 0_u32;
     let mut timed_playback_started = false;
     device.build_output_stream(
         config,
         move |output: &mut [T], info| {
             let callback_frames = output.len() / channels.max(1);
-            endpoint_latency_millis = endpoint_latency_millis.max(output_latency_millis(
-                info,
-                output_sample_rate,
-                callback_frames,
-            ));
+            if !endpoint_latency_initialized || latency_refresh_countdown == 0 {
+                let measured_latency =
+                    output_latency_millis(info, output_sample_rate, callback_frames);
+                endpoint_latency_millis = if endpoint_latency_initialized {
+                    endpoint_latency_millis * (1.0 - MIPLAY_OUTPUT_LATENCY_SMOOTHING)
+                        + measured_latency * MIPLAY_OUTPUT_LATENCY_SMOOTHING
+                } else {
+                    measured_latency
+                };
+                endpoint_latency_initialized = true;
+                latency_refresh_countdown = MIPLAY_OUTPUT_LATENCY_REFRESH_CALLBACKS;
+            } else {
+                latency_refresh_countdown -= 1;
+            }
+            latency_telemetry.update_output_latency(endpoint_latency_millis);
             if !callback_started_for_audio.swap(true, Ordering::AcqRel) {
                 callback_events(json!({
                     "event": "audio_output_callback_started",
@@ -2485,6 +2772,7 @@ where
                 if let Ok(mut queue) = queue.try_lock() {
                     queue.clear();
                 }
+                latency_telemetry.update_buffered_frames(0);
                 for sample in output {
                     *sample = T::from_sample(0.0);
                 }
@@ -2496,6 +2784,7 @@ where
                 }
                 return;
             };
+            latency_telemetry.update_buffered_frames(queue.buffered_frames());
             let synchronized_frames = synchronized_buffer_frames(endpoint_latency_millis);
             let mut leading_silence_frames = 0_usize;
             let mut synchronization_mode = "buffer_window";
@@ -2579,6 +2868,7 @@ where
                     *sample = T::from_sample(value);
                 }
             }
+            latency_telemetry.update_buffered_frames(queue.buffered_frames());
             if callback_peak > 0.000_01 && !signal_started_for_audio.swap(true, Ordering::AcqRel) {
                 callback_events(json!({
                     "event": "audio_output_signal_started",
@@ -2706,6 +2996,30 @@ fn send_rtsp_response(stream: &mut TcpStream, cseq: &str, body: &str) -> Result<
         .context("write RTSP response")
 }
 
+fn video_latency_request(cseq: u32, snapshot: MiPlayLatencySnapshot) -> String {
+    format!(
+        "VIDEO_LATENCY rtsp://localhost/wfd1.0 RTSP/1.0\r\n\
+         User-Agent: stagefright/1.1 (Linux;Android 4.1)\r\n\
+         CSeq: {cseq}\r\n\
+         Content-Type: text/parameters\r\n\
+         latency:{}\r\n\
+         bitrate:{}\r\n\
+         rtpPacketNum:{}\r\n\
+         Content-Length:0\r\n\r\n",
+        snapshot.latency_millis, snapshot.bitrate_bps, snapshot.rtp_packet_number,
+    )
+}
+
+fn send_video_latency_request(
+    stream: &mut TcpStream,
+    cseq: u32,
+    snapshot: MiPlayLatencySnapshot,
+) -> Result<()> {
+    stream
+        .write_all(video_latency_request(cseq, snapshot).as_bytes())
+        .context("write MiPlay VIDEO_LATENCY feedback")
+}
+
 fn parameter_value<'a>(body: &'a str, name: &str) -> Option<&'a str> {
     body.lines().find_map(|line| {
         let (candidate, value) = line.split_once(':')?;
@@ -2732,17 +3046,19 @@ fn random_hex_32() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdtsFramer, ClockFitPoint, MAX_RTSP_MESSAGE_BYTES, MIPLAY_SAMPLE_RATE_HZ,
-        MIPLAY_SOURCE_CHANNELS, PcmQueue, StreamKeys, TsDemuxer, adts_bitrate, adts_sample_rate,
-        decode_timer_sample, fit_clock_line, is_adts, normalized_output_latency_millis,
+        AdtsFramer, ClockFitPoint, MAX_RTSP_MESSAGE_BYTES, MIPLAY_RTP_CLOCK_HZ,
+        MIPLAY_SAMPLE_RATE_HZ, MIPLAY_SOURCE_CHANNELS, MiPlayLatencyTelemetry, PcmQueue,
+        StreamKeys, TsDemuxer, adts_bitrate, adts_sample_rate, decode_timer_sample,
+        extend_wrapping_counter, fit_clock_line, is_adts, normalized_output_latency_millis,
         parse_rtp_packet, parse_timer_server, pes_private_data_iv, pes_pts_micros,
         presentation_schedule_error_micros, rtp_payload, should_hard_drop_late_frames,
         smooth_clock_model, synchronized_buffer_frames, trimmed_clock_offset,
         try_parse_rtsp_message, usable_presentation_schedule_error_micros,
-        validate_miplay_sample_rate,
+        validate_miplay_sample_rate, video_latency_request,
     };
     use aes::Aes128;
     use aes::cipher::{BlockModeEncrypt, KeyIvInit, block_padding::NoPadding};
+    use std::time::{Duration as StdDuration, Instant};
 
     #[test]
     fn validates_stream_key_lengths() {
@@ -2842,10 +3158,47 @@ mod tests {
     #[test]
     fn converts_xiaomi_rtp_clock_to_microseconds() {
         let packet = [
-            0x80, 0xa1, 0, 1, 0, 0, 0xbb, 0x80, 0xde, 0xad, 0xbe, 0xef, 1,
+            0x80, 0xa1, 0, 1, 0, 1, 0x5f, 0x90, 0xde, 0xad, 0xbe, 0xef, 1,
         ];
         let parsed = parse_rtp_packet(&packet).unwrap();
         assert_eq!(parsed.timestamp_micros, 1_000_000);
+        assert_eq!(parsed.timestamp, MIPLAY_RTP_CLOCK_HZ);
+        assert_eq!(parsed.sequence_number, 1);
+    }
+
+    #[test]
+    fn extends_rtp_sequence_across_the_sixteen_bit_wrap() {
+        assert_eq!(extend_wrapping_counter(Some(65_535), 0, 16), 65_536);
+        assert_eq!(extend_wrapping_counter(Some(65_536), 65_535, 16), 65_535);
+    }
+
+    #[test]
+    fn latency_feedback_uses_live_queue_bitrate_and_extended_rtp_number() {
+        let telemetry = MiPlayLatencyTelemetry::new();
+        let started = Instant::now();
+        for index in 0..20_u32 {
+            telemetry.observe_rtp(
+                (65_530 + index) as u16,
+                48_000_000_u32 + index * 1_920,
+                900,
+                started + StdDuration::from_micros(u64::from(index) * 21_333),
+            );
+        }
+        telemetry.update_buffered_frames(30_000);
+        telemetry.update_output_latency(20.0);
+
+        let snapshot = telemetry.snapshot().expect("RTP telemetry");
+        assert_eq!(snapshot.latency_millis, 645);
+        assert_eq!(snapshot.rtp_packet_number, 65_549);
+        assert!(snapshot.bitrate_bps > 300_000);
+        assert!(snapshot.arrival_residual_millis.abs() < 1.0);
+
+        let request = video_latency_request(1_234, snapshot);
+        assert!(request.starts_with("VIDEO_LATENCY rtsp://localhost/wfd1.0 RTSP/1.0\r\n"));
+        assert!(request.contains("CSeq: 1234\r\n"));
+        assert!(request.contains("latency:645\r\n"));
+        assert!(request.contains("rtpPacketNum:65549\r\n"));
+        assert!(request.ends_with("Content-Length:0\r\n\r\n"));
     }
 
     #[test]
@@ -2882,25 +3235,15 @@ mod tests {
 
     #[test]
     fn timer_line_fit_recovers_clock_frequency_drift() {
-        let history = [
-            ClockFitPoint {
-                local_micros: 0,
-                offset_micros: 1_000,
-            },
-            ClockFitPoint {
-                local_micros: 5_000_000,
-                offset_micros: 1_500,
-            },
-            ClockFitPoint {
-                local_micros: 10_000_000,
-                offset_micros: 2_000,
-            },
-        ]
-        .into_iter()
-        .collect();
+        let history = (0_i64..20)
+            .map(|index| ClockFitPoint {
+                local_micros: index * 5_000_000,
+                offset_micros: 1_000 + index * 500,
+            })
+            .collect();
         let (base, offset, frequency) = fit_clock_line(&history);
-        assert_eq!(base, 10_000_000);
-        assert!((offset - 2_000.0).abs() < 0.001);
+        assert_eq!(base, 95_000_000);
+        assert!((offset - 10_500.0).abs() < 0.001);
         assert!((frequency - 1.0001).abs() < 0.000_000_1);
     }
 

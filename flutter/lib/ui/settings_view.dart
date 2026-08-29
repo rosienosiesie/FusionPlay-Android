@@ -6,10 +6,11 @@ import '../models/app_state.dart';
 import '../theme/fusion_theme.dart';
 import 'g2_shape.dart';
 import 'remote_focus.dart';
+import 'vector_icon.dart';
 
 const fusionPlayVersion = String.fromEnvironment(
   'FUSIONPLAY_VERSION',
-  defaultValue: '1.2.2',
+  defaultValue: '1.2.4',
 );
 
 class SettingsView extends StatefulWidget {
@@ -129,7 +130,7 @@ class _SettingsViewState extends State<SettingsView> {
                   onChanged: widget.onAirPlay,
                 ),
                 _switchRow(
-                  icon: Icons.cast_rounded,
+                  asset: FusionIcons.dlna,
                   title: 'DLNA',
                   value: settings.dlnaEnabled,
                   onChanged: widget.onDlna,
@@ -178,8 +179,8 @@ class _SettingsViewState extends State<SettingsView> {
           width: 42,
           height: 42,
           child: Center(
-            child: Icon(
-              Icons.info_outline_rounded,
+            child: FusionVectorIcon(
+              FusionIcons.about,
               size: 25,
               color: SettingsStyle.iconColor,
             ),
@@ -225,8 +226,8 @@ class _SettingsViewState extends State<SettingsView> {
                 width: 42,
                 height: 42,
                 child: Center(
-                  child: Icon(
-                    Icons.description_outlined,
+                  child: FusionVectorIcon(
+                    FusionIcons.exportLogs,
                     size: 25,
                     color: SettingsStyle.iconColor,
                   ),
@@ -283,7 +284,7 @@ class _SettingsViewState extends State<SettingsView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _SectionTitle(icon: Icons.edit_rounded, text: '自定义名称'),
+          const _SectionTitle(asset: FusionIcons.customName, text: '自定义名称'),
           const SizedBox(height: 12),
           Focus(
             canRequestFocus: false,
@@ -660,8 +661,8 @@ class _FocusReceiverNameIntent extends Intent {
 }
 
 class _SectionTitle extends StatelessWidget {
-  const _SectionTitle({required this.icon, required this.text});
-  final IconData icon;
+  const _SectionTitle({required this.asset, required this.text});
+  final String asset;
   final String text;
 
   @override
@@ -671,7 +672,11 @@ class _SectionTitle extends StatelessWidget {
         width: 42,
         height: 42,
         child: Center(
-          child: Icon(icon, size: 25, color: SettingsStyle.iconColor),
+          child: FusionVectorIcon(
+            asset,
+            size: 25,
+            color: SettingsStyle.iconColor,
+          ),
         ),
       ),
       const SizedBox(width: 14),

@@ -168,7 +168,7 @@ try {
         $releaseDirectory = Join-Path $repositoryRoot 'artifacts\releases'
         [System.IO.Directory]::CreateDirectory($releaseDirectory) | Out-Null
         $apkSource = Join-Path $mappedProjectRoot 'build\app\outputs\flutter-apk\app-release.apk'
-        $apkDestination = Join-Path $releaseDirectory "FusionPlay-$fusionPlayVersion-universal.apk"
+        $apkDestination = Join-Path $releaseDirectory "FusionPlay-Android-$fusionPlayVersion.apk"
         Copy-Item -LiteralPath $apkSource -Destination $apkDestination -Force
 
         $symbolArchive = Join-Path $releaseDirectory "FusionPlay-$fusionPlayVersion-symbols.zip"

@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 
 $sourcePath = Join-Path $ProjectRoot "brand-FusionPlay-Mark.png"
-$resourcePath = Join-Path $ProjectRoot "app\src\main\res"
+$resourcePath = Join-Path $ProjectRoot "flutter\android\app\src\main\res"
 
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     throw "FusionPlay icon source was not found: $sourcePath"

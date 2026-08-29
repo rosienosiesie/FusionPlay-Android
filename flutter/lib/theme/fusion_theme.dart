@@ -52,10 +52,7 @@ abstract final class FusionColors {
 }
 
 abstract final class FusionTypography {
-  // Android's generic sans-serif family resolves through the system font.
-  // Naming it explicitly avoids Flutter's bundled
-  // default font taking precedence for Latin text and numerals.
-  static const String fontFamily = 'sans-serif';
+  static const String fontFamily = 'MiSans';
   static const regularFontWeight = FontWeight.w400;
   static const mediumFontWeight = FontWeight.w500;
   static const semiBoldFontWeight = FontWeight.w600;
@@ -64,7 +61,7 @@ abstract final class FusionTypography {
   // Match the Android typography contract directly: body copy is 400,
   // interactive labels are 500, regular headings are 600, and the highest
   // emphasis level is 700. Keep FontWeight and the variable-font axis aligned
-  // so the platform sans font does not render lighter than its semantic role.
+  // so MiSans does not render lighter than its semantic Material role.
   static const regular = <FontVariation>[FontVariation('wght', 400)];
   static const medium = <FontVariation>[FontVariation('wght', 500)];
   static const semiBold = <FontVariation>[FontVariation('wght', 600)];

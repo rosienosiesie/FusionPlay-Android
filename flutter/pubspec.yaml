@@ -4,7 +4,7 @@ homepage: https://github.com/rosienosiesie/FusionPlay
 repository: https://github.com/rosienosiesie/FusionPlay
 issue_tracker: https://github.com/rosienosiesie/FusionPlay/issues
 publish_to: none
-version: 1.2.3+10203
+version: 1.2.4+10204
 
 environment:
   sdk: ^3.8.0
@@ -22,6 +22,7 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
+    - assets/DLNA.svg
     - assets/airplay-broadcast.svg
     - assets/auto-wake.svg
     - assets/device-speaker.svg
@@ -31,7 +32,16 @@ flutter:
     - assets/icon-pause.svg
     - assets/icon-play-arrow.svg
     - assets/icon-power-settings-new.svg
+    - assets/icon-close.svg
+    - assets/icon-settings.svg
     - assets/icon-skip-next.svg
     - assets/icon-skip-previous.svg
     - assets/miplay-logo.svg
     - assets/music-note-placeholder.svg
+    - assets/关于应用.svg
+    - assets/导出日志.svg
+    - assets/自定义名称.svg
+  fonts:
+    - family: MiSans
+      fonts:
+        - asset: assets/fonts/MiSansVF.ttf
